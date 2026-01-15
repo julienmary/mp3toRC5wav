@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+
+# mp3torc5wav : MP3 → WAV 44.1 kHz 32-bit float -24 LUFS + option copie RC-5 storage
+
+usage() {
+    echo "Usage: $0 [--url <URL>] [--save-to-rc5-first-free-slot | --save-to-slot X] <fichier.mp3>"
+    echo "  X = 1..99"
+    exit 1
+}
+
+dl_url=""
+save_first_free=0
+save_slot=""
+input=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --url) dl_url="$2"; shift 2 ;;
+        --save-to-rc5-first-free-slot) save_first_free=1; shift ;;
+        --save-to-slot) save_slot="$2"; shift 2 ;;
+        *) input="$1"; shift ;;
+    esac
+done
+
+if [ -n "$dl_url" ] && [ -z "$input" ]; then input=""; fi
+if [ $# -ne 0 ] || ([ $save_first_free -eq 1 ] && [ -n "$save_slot" ]); then usage; fi
+if [ -z "$input" ] && [ -z "$dl_url" ]; then usage; fi
+
+# DL si --url
+if [ -n "$dl_url" ]; then
+    input="$(basename "$dl_url" | sed 's/\?.*//').mp3"
+    yt-dlp -x --audio-format mp3 --audio-quality 0 "$dl_url" -o "$input"
+    [ $? -ne 0 ] && { echo "Échec DL"; exit 1; }
+fi
+
+if [[ ! "$input" =~ \.[mM][pP]3$ ]]; then
+    echo "Erreur : fichier doit être .mp3"
+    exit 1
+fi
+
+wav_temp="${input%.*}_temp.wav"
+wav_final="${input%.*}_rc5.wav"
+
+# Conversion + normalisation
+ffmpeg -y -i "$input" -c:a pcm_f32le -ar 44100 -ac 2 "$wav_temp" 2>/dev/null || { echo "Échec conversion"; rm -f "$wav_temp"; exit 1; }
+ffmpeg -y -i "$wav_temp" -af loudnorm=I=-24:TP=-3:LRA=11 -c:a pcm_f32le -ar 44100 -ac 2 "$wav_final" 2>/dev/null
+
+if [ $? -ne 0 ] || [ ! -f "$wav_final" ]; then
+    echo "Échec normalisation"
+    rm -f "$wav_temp" "$wav_final"
+    [ -n "$dl_url" ] && rm -f "$input"
+    exit 1
+fi
+
+echo "OK → $wav_final créé (-24 LUFS, 32-bit float)"
+
+# Détection RC-5 mountpoints
+mapfile -t mounts < <(lsblk -o MOUNTPOINT | grep -i 'RC-5' | awk '{$1=$1};1' | grep '^/')
+if [ ${#mounts[@]} -eq 0 ]; then
+    echo "Aucun BOSS RC-5 détecté en mode storage"
+    rm -f "$wav_temp" "$input"
+    exit 1
+elif [ ${#mounts[@]} -gt 1 ]; then
+    echo "Plusieurs RC-5 détectées :"
+    for i in "${!mounts[@]}"; do
+        echo "$((i+1))) ${mounts[i]}"
+    done
+    read -p "Choisissez le numéro (1-${#mounts[@]}): " choice
+    if ! [[ "$choice" =~ ^[1-9][0-9]?$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#mounts[@]} ]; then
+        echo "Choix invalide"
+        rm -f "$wav_temp" "$input"
+        exit 1
+    fi
+    BASEPATH="${mounts[$((choice-1))]}"
+else
+    BASEPATH="${mounts[0]}"
+fi
+
+SUFFIX="ROLAND/WAVE"
+WAVE_DIR="${BASEPATH}/${SUFFIX}"
+if [ ! -d "$WAVE_DIR" ]; then
+    echo "Erreur : $WAVE_DIR absent → pas une RC-5 valide"
+    rm -f "$wav_temp" "$input"
+    exit 1
+fi
+
+# Fonction format slot
+slot_dir() {
+    printf "%03d_1" "$1"
+}
+
+# Cas --save-to-rc5-first-free-slot
+if [ $save_first_free -eq 1 ]; then
+    found=0
+    for n in {1..99}; do
+        dir="${WAVE_DIR}/$(slot_dir $n)"
+	if [ ! -d "$dir" ] || [ -z "$(find "$dir" -maxdepth 1 -type f -iname '*.wav' -print -quit)" ]; then
+	    target_dir="$dir"
+	    slot_num=$n
+	    found=1
+	    break
+	fi
+    done
+    if [ $found -eq 0 ]; then
+        echo "Aucun slot libre trouvé (1-99)"
+        rm -f "$wav_temp" "$input"
+        exit 1
+    fi
+
+# Cas --save-to-slot X
+elif [ -n "$save_slot" ]; then
+    if ! [[ "$save_slot" =~ ^[1-9][0-9]?$ ]] || [ "$save_slot" -lt 1 ] || [ "$save_slot" -gt 99 ]; then
+        echo "Slot invalide (1-99)"
+        rm -f "$wav_temp" "$input"
+        exit 1
+    fi
+    target_dir="${WAVE_DIR}/$(slot_dir $save_slot)"
+    slot_num=$save_slot
+
+    # Vérif occupation
+    if [ -d "$target_dir" ] && ls "$target_dir"/*.wav >/dev/null 2>&1; then
+        echo "Slot $slot_num déjà occupé :"
+        ls -1 "$target_dir"/*.wav
+        read -p "Remplacer ? (o/n) " confirm
+        if [[ ! "$confirm" =~ ^[oO]$ ]]; then
+            echo "Opération annulée"
+            rm -f "$wav_temp" "$input"
+            exit 0
+        fi
+        rm -f "$target_dir"/*.wav
+    fi
+else
+    # Pas d'option save → fin
+    rm -f "$wav_temp"
+    [ -n "$dl_url" ] && rm -f "$input"
+    exit 0
+fi
+
+# Création dossier si besoin (rare)
+mkdir -p "$target_dir"
+
+# Copie
+cp "$wav_final" "$target_dir/"
+if [ $? -eq 0 ]; then
+    echo "Soundfile copiée dans la mémoire $slot_num"
+else
+    echo "Échec copie dans $target_dir"
+fi
+
+# Nettoyage
+rm -f "$wav_temp" "$wav_final"
+[ -n "$dl_url" ] && rm -f "$input"
+
+exit 0
